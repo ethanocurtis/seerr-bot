@@ -1,0 +1,7 @@
+services:
+  seerr-discord-bot:
+    build: .
+    container_name: seerr-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
