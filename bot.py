@@ -134,11 +134,12 @@ def build_results_embed(query: str, media_type: str, items: list[SearchItem]) ->
 
 
 def build_confirm_embed(item: SearchItem, kind: Literal["movie", "series"]) -> discord.Embed:
-    status_text = "Ready to request"
     if item.is_available:
         status_text = "Already available"
     elif item.is_requested:
         status_text = "Already requested"
+    else:
+        status_text = "Ready to request"
 
     embed = discord.Embed(
         title=f"{item.title} ({item.year})",
@@ -220,8 +221,39 @@ class SeerrClient:
 
             year = release_date[:4] if len(release_date) >= 4 else "Unknown"
             media_info = item.get("mediaInfo") or {}
-            status = str(media_info.get("status", "")).lower()
+
+            log.info("Search result media_info for %s: %s", title, media_info)
+
+            raw_status = media_info.get("status")
+            status_text = str(raw_status).strip().lower() if raw_status is not None else ""
+
+            raw_status_4k = media_info.get("status4k")
+            status_4k_text = str(raw_status_4k).strip().lower() if raw_status_4k is not None else ""
+
+            download_status = media_info.get("downloadStatus")
+            download_status_text = (
+                str(download_status).strip().lower() if download_status is not None else ""
+            )
+
             requests = media_info.get("requests") or []
+
+            is_available = any(
+                [
+                    status_text == "available",
+                    status_4k_text == "available",
+                    download_status_text == "available",
+                    bool(media_info.get("canWatch")),
+                    bool(media_info.get("available")),
+                ]
+            )
+
+            is_requested = any(
+                [
+                    len(requests) > 0,
+                    status_text == "requested",
+                    bool(media_info.get("requested")),
+                ]
+            )
 
             parsed.append(
                 SearchItem(
@@ -231,8 +263,8 @@ class SeerrClient:
                     year=year,
                     overview=item.get("overview", "No overview provided."),
                     poster_path=item.get("posterPath"),
-                    is_available=status == "available",
-                    is_requested=len(requests) > 0,
+                    is_available=is_available,
+                    is_requested=is_requested,
                 )
             )
 
@@ -270,6 +302,20 @@ class SeasonRequestModal(discord.ui.Modal, title="Request Seasons"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         try:
+            if self.item.is_available:
+                await interaction.response.send_message(
+                    f"**{self.item.title} ({self.item.year})** is already available.",
+                    ephemeral=True,
+                )
+                return
+
+            if self.item.is_requested:
+                await interaction.response.send_message(
+                    f"**{self.item.title} ({self.item.year})** has already been requested.",
+                    ephemeral=True,
+                )
+                return
+
             parsed = parse_season_input(str(self.season_input))
 
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -322,9 +368,16 @@ class MovieConfirmView(discord.ui.View):
         self.item = item
         self.requester_id = requester_id
 
+        button_label = "Request Movie"
+        if item.is_available:
+            button_label = "Already Available"
+        elif item.is_requested:
+            button_label = "Already Requested"
+
         request_button = discord.ui.Button(
-            label="Request Movie",
+            label=button_label,
             style=discord.ButtonStyle.green,
+            disabled=item.is_available or item.is_requested,
         )
         request_button.callback = self.request_callback
         self.add_item(request_button)
@@ -378,9 +431,16 @@ class SeriesConfirmView(discord.ui.View):
         self.item = item
         self.requester_id = requester_id
 
+        button_label = "Request Series"
+        if item.is_available:
+            button_label = "Already Available"
+        elif item.is_requested:
+            button_label = "Already Requested"
+
         request_button = discord.ui.Button(
-            label="Request Series",
+            label=button_label,
             style=discord.ButtonStyle.green,
+            disabled=item.is_available or item.is_requested,
         )
         request_button.callback = self.request_callback
         self.add_item(request_button)
