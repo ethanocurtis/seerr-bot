@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -146,7 +147,8 @@ class SeerrClient:
             return {}
 
     async def search(self, query: str, wanted_type: Literal["movie", "tv"]) -> list[SearchItem]:
-        data = await self._get("/search", query=query, page=1, language="en")
+        encoded_query = quote(query, safe="")
+        data = await self._get("/search", query=encoded_query, page=1, language="en")
         results = data.get("results", [])
 
         parsed: list[SearchItem] = []
@@ -267,11 +269,12 @@ class MovieSelect(discord.ui.Select):
             elif item.is_requested:
                 status_bits.append("already requested")
 
-            status_text = f" • {', '.join(status_bits)}" if status_bits else ""
             label = f"{item.title} ({item.year})"
-            description = (item.overview[:80] + "...") if len(item.overview) > 80 else item.overview
+            description = item.overview or ""
+            if len(description) > 80:
+                description = description[:77] + "..."
             if not description:
-                description = f"MOVIE{status_text}"
+                description = ", ".join(status_bits) if status_bits else "Movie result"
 
             options.append(
                 discord.SelectOption(
@@ -354,11 +357,12 @@ class SeriesSelect(discord.ui.Select):
             elif item.is_requested:
                 status_bits.append("already requested")
 
-            status_text = f" • {', '.join(status_bits)}" if status_bits else ""
             label = f"{item.title} ({item.year})"
-            description = (item.overview[:80] + "...") if len(item.overview) > 80 else item.overview
+            description = item.overview or ""
+            if len(description) > 80:
+                description = description[:77] + "..."
             if not description:
-                description = f"SERIES{status_text}"
+                description = ", ".join(status_bits) if status_bits else "Series result"
 
             options.append(
                 discord.SelectOption(
@@ -399,8 +403,7 @@ class SeriesSelect(discord.ui.Select):
             )
             return
 
-        modal = SeasonRequestModal(self.seerr, selected)
-        await interaction.response.send_modal(modal)
+        await interaction.response.send_modal(SeasonRequestModal(self.seerr, selected))
 
 
 class MovieRequestView(discord.ui.View):
@@ -423,6 +426,71 @@ class SeriesRequestView(discord.ui.View):
             child.disabled = True
 
 
+class RequestGroup(app_commands.Group):
+    def __init__(self) -> None:
+        super().__init__(name="request", description="Request movies and series from Seerr")
+
+    @app_commands.command(name="movie", description="Search Seerr and request a movie")
+    @app_commands.describe(title="Movie title to search for")
+    async def movie(self, interaction: discord.Interaction, title: str) -> None:
+        bot_instance = interaction.client
+        if not isinstance(bot_instance, SeerrBot):
+            await interaction.response.send_message("Bot client error.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            results = await bot_instance.seerr.search(title, "movie")
+            if not results:
+                await interaction.followup.send(
+                    f'No movie results found for **"{title}"**.',
+                    ephemeral=True,
+                )
+                return
+
+            embed = build_results_embed(title, "movies", results)
+            view = MovieRequestView(bot_instance.seerr, results, interaction.user.id)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        except Exception as exc:
+            log.exception("Movie search failed")
+            await interaction.followup.send(
+                f"Movie search failed: `{exc}`",
+                ephemeral=True,
+            )
+
+    @app_commands.command(name="series", description="Search Seerr and request a TV series")
+    @app_commands.describe(title="Series title to search for")
+    async def series(self, interaction: discord.Interaction, title: str) -> None:
+        bot_instance = interaction.client
+        if not isinstance(bot_instance, SeerrBot):
+            await interaction.response.send_message("Bot client error.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            results = await bot_instance.seerr.search(title, "tv")
+            if not results:
+                await interaction.followup.send(
+                    f'No series results found for **"{title}"**.',
+                    ephemeral=True,
+                )
+                return
+
+            embed = build_results_embed(title, "series", results)
+            view = SeriesRequestView(bot_instance.seerr, results, interaction.user.id)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+        except Exception as exc:
+            log.exception("Series search failed")
+            await interaction.followup.send(
+                f"Series search failed: `{exc}`",
+                ephemeral=True,
+            )
+
+
 class SeerrBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -431,10 +499,10 @@ class SeerrBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.seerr.start()
+        self.tree.add_command(RequestGroup())
 
         if DISCORD_GUILD_ID:
             guild = discord.Object(id=int(DISCORD_GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
             log.info("Synced commands to guild %s", DISCORD_GUILD_ID)
         else:
@@ -444,9 +512,6 @@ class SeerrBot(commands.Bot):
     async def close(self) -> None:
         await self.seerr.close()
         await super().close()
-
-
-bot = SeerrBot()
 
 
 def build_results_embed(query: str, media_type: str, items: list[SearchItem]) -> discord.Embed:
@@ -474,61 +539,13 @@ def build_results_embed(query: str, media_type: str, items: list[SearchItem]) ->
     return embed
 
 
-@bot.tree.command(name="movie", description="Search Seerr and request a movie")
-@app_commands.describe(title="Movie title to search for")
-async def movie(interaction: discord.Interaction, title: str) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    try:
-        results = await bot.seerr.search(title, "movie")
-        if not results:
-            await interaction.followup.send(
-                f'No movie results found for **"{title}"**.',
-                ephemeral=True,
-            )
-            return
-
-        embed = build_results_embed(title, "movies", results)
-        view = MovieRequestView(bot.seerr, results, interaction.user.id)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    except Exception as exc:
-        log.exception("Movie search failed")
-        await interaction.followup.send(
-            f"Movie search failed: `{exc}`",
-            ephemeral=True,
-        )
-
-
-@bot.tree.command(name="series", description="Search Seerr and request a TV series")
-@app_commands.describe(title="Series title to search for")
-async def series(interaction: discord.Interaction, title: str) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    try:
-        results = await bot.seerr.search(title, "tv")
-        if not results:
-            await interaction.followup.send(
-                f'No series results found for **"{title}"**.',
-                ephemeral=True,
-            )
-            return
-
-        embed = build_results_embed(title, "series", results)
-        view = SeriesRequestView(bot.seerr, results, interaction.user.id)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    except Exception as exc:
-        log.exception("Series search failed")
-        await interaction.followup.send(
-            f"Series search failed: `{exc}`",
-            ephemeral=True,
-        )
+bot = SeerrBot()
 
 
 @bot.event
 async def on_ready() -> None:
-    log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+    if bot.user:
+        log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
 
 async def main() -> None:
