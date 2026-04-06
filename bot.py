@@ -204,39 +204,63 @@ class SeerrClient:
                 return await resp.json()
             return {}
 
-    def _extract_state(self, media_info: dict[str, Any] | None) -> tuple[bool, bool]:
-        media_info = media_info or {}
+    def _walk_values(self, obj: Any):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                yield key, value
+                yield from self._walk_values(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from self._walk_values(item)
 
-        raw_status = media_info.get("status")
-        status_text = str(raw_status).strip().lower() if raw_status is not None else ""
+    def _has_requested_marker(self, obj: Any) -> bool:
+        for key, value in self._walk_values(obj):
+            key_l = str(key).lower()
 
-        raw_status_4k = media_info.get("status4k")
-        status_4k_text = str(raw_status_4k).strip().lower() if raw_status_4k is not None else ""
+            if key_l == "requests" and isinstance(value, list) and len(value) > 0:
+                return True
 
-        download_status = media_info.get("downloadStatus")
-        download_status_text = (
-            str(download_status).strip().lower() if download_status is not None else ""
-        )
+            if key_l in {"requested", "isrequested"} and value is True:
+                return True
 
-        requests = media_info.get("requests") or []
+            if key_l in {"status", "downloadstatus", "status4k"}:
+                value_l = str(value).strip().lower()
+                if value_l in {"requested", "pending", "processing", "partially_requested"}:
+                    return True
 
-        is_available = any(
-            [
-                status_text == "available",
-                status_4k_text == "available",
-                download_status_text == "available",
-                bool(media_info.get("canWatch")),
-                bool(media_info.get("available")),
-            ]
-        )
+            if key_l in {"requestcount", "request_count"}:
+                try:
+                    if int(value) > 0:
+                        return True
+                except Exception:
+                    pass
 
-        is_requested = any(
-            [
-                len(requests) > 0,
-                status_text == "requested",
-                bool(media_info.get("requested")),
-            ]
-        )
+        return False
+
+    def _has_available_marker(self, obj: Any) -> bool:
+        for key, value in self._walk_values(obj):
+            key_l = str(key).lower()
+
+            if key_l in {"available", "canwatch", "isavailable"} and value is True:
+                return True
+
+            if key_l in {"status", "downloadstatus", "status4k"}:
+                value_l = str(value).strip().lower()
+                if value_l in {"available", "partially_available"}:
+                    return True
+
+        return False
+
+    def _extract_state(self, data: dict[str, Any] | None) -> tuple[bool, bool]:
+        data = data or {}
+        media_info = data.get("mediaInfo") if isinstance(data, dict) else {}
+
+        is_available = self._has_available_marker(data) or self._has_available_marker(media_info)
+        is_requested = self._has_requested_marker(data) or self._has_requested_marker(media_info)
+
+        # If it's already available, don't also present it as merely "requested".
+        if is_available:
+            is_requested = False
 
         return is_available, is_requested
 
@@ -260,8 +284,7 @@ class SeerrClient:
                 release_date = item.get("firstAirDate") or ""
 
             year = release_date[:4] if len(release_date) >= 4 else "Unknown"
-            media_info = item.get("mediaInfo") or {}
-            is_available, is_requested = self._extract_state(media_info)
+            is_available, is_requested = self._extract_state(item)
 
             parsed.append(
                 SearchItem(
@@ -283,8 +306,7 @@ class SeerrClient:
         path = f"/movie/{item.media_id}" if item.media_type == "movie" else f"/tv/{item.media_id}"
         data = await self._get(path)
 
-        media_info = data.get("mediaInfo") or {}
-        is_available, is_requested = self._extract_state(media_info)
+        is_available, is_requested = self._extract_state(data)
 
         poster_path = data.get("posterPath") or item.poster_path
         overview = data.get("overview") or item.overview
@@ -299,13 +321,14 @@ class SeerrClient:
         year = release_date[:4] if len(release_date) >= 4 else item.year
 
         log.info(
-            "Refreshed state for %s (%s): available=%s requested=%s media_info=%s",
+            "Refreshed state for %s (%s) type=%s: available=%s requested=%s",
             title,
             year,
+            item.media_type,
             is_available,
             is_requested,
-            media_info,
         )
+        log.info("TV/Movie detail payload for %s: %s", title, data)
 
         return SearchItem(
             media_id=item.media_id,
@@ -512,23 +535,36 @@ class SeriesConfirmView(discord.ui.View):
             )
             return
 
-        refreshed = await self.seerr.refresh_item_state(self.item)
+        try:
+            refreshed = await self.seerr.refresh_item_state(self.item)
 
-        if refreshed.is_available:
-            await interaction.response.send_message(
-                f"**{refreshed.title} ({refreshed.year})** is already available.",
-                ephemeral=True,
-            )
-            return
+            if refreshed.is_available:
+                await interaction.response.send_message(
+                    f"**{refreshed.title} ({refreshed.year})** is already available.",
+                    ephemeral=True,
+                )
+                return
 
-        if refreshed.is_requested:
-            await interaction.response.send_message(
-                f"**{refreshed.title} ({refreshed.year})** has already been requested.",
-                ephemeral=True,
-            )
-            return
+            if refreshed.is_requested:
+                await interaction.response.send_message(
+                    f"**{refreshed.title} ({refreshed.year})** has already been requested.",
+                    ephemeral=True,
+                )
+                return
 
-        await interaction.response.send_modal(SeasonRequestModal(self.seerr, refreshed))
+            await interaction.response.send_modal(SeasonRequestModal(self.seerr, refreshed))
+        except Exception as exc:
+            log.exception("Failed before opening series modal")
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"Series pre-check failed: `{exc}`",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Series pre-check failed: `{exc}`",
+                    ephemeral=True,
+                )
 
 
 class MovieSelect(discord.ui.Select):
