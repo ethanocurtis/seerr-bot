@@ -48,17 +48,6 @@ class SearchItem:
 
 
 def parse_season_input(text: str) -> str | list[int]:
-    """
-    Accepts:
-      all
-      1
-      1,2,3
-      1-4
-      1,3,5-7
-
-    Returns:
-      "all" or sorted list[int]
-    """
     raw = text.strip().lower()
 
     if raw == "all":
@@ -82,10 +71,12 @@ def parse_season_input(text: str) -> str | list[int]:
             start_str, end_str = re.split(r"\s*-\s*", part)
             start = int(start_str)
             end = int(end_str)
+
             if start < 1 or end < 1:
                 raise ValueError("Season numbers must be 1 or higher.")
             if start > end:
                 raise ValueError(f"Invalid range: {part}")
+
             for num in range(start, end + 1):
                 seasons.add(num)
             continue
@@ -167,7 +158,6 @@ class SeerrClient:
 
             year = release_date[:4] if len(release_date) >= 4 else "Unknown"
             media_info = item.get("mediaInfo") or {}
-
             status = str(media_info.get("status", "")).lower()
             requests = media_info.get("requests") or []
 
@@ -223,7 +213,11 @@ class SeasonRequestModal(discord.ui.Modal, title="Request Seasons"):
             await interaction.response.defer(ephemeral=True, thinking=True)
             await self.seerr.request_series(self.item.media_id, parsed)
 
-            seasons_text = "all seasons" if parsed == "all" else f"seasons: {', '.join(map(str, parsed))}"
+            seasons_text = (
+                "all seasons"
+                if parsed == "all"
+                else f"seasons: {', '.join(map(str, parsed))}"
+            )
 
             embed = discord.Embed(
                 title="Series request sent",
@@ -232,10 +226,16 @@ class SeasonRequestModal(discord.ui.Modal, title="Request Seasons"):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except ValueError as exc:
-            await interaction.response.send_message(
-                f"Invalid season input: {exc}",
-                ephemeral=True,
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    f"Invalid season input: {exc}",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Invalid season input: {exc}",
+                    ephemeral=True,
+                )
         except Exception as exc:
             log.exception("Failed to request series")
             if interaction.response.is_done():
@@ -263,17 +263,16 @@ class MovieSelect(discord.ui.Select):
 
         options: list[discord.SelectOption] = []
         for idx, item in enumerate(items):
-            status_bits = []
-            if item.is_available:
-                status_bits.append("available")
-            elif item.is_requested:
-                status_bits.append("already requested")
-
             label = f"{item.title} ({item.year})"
             description = item.overview or ""
             if len(description) > 80:
                 description = description[:77] + "..."
             if not description:
+                status_bits = []
+                if item.is_available:
+                    status_bits.append("available")
+                elif item.is_requested:
+                    status_bits.append("already requested")
                 description = ", ".join(status_bits) if status_bits else "Movie result"
 
             options.append(
@@ -351,17 +350,16 @@ class SeriesSelect(discord.ui.Select):
 
         options: list[discord.SelectOption] = []
         for idx, item in enumerate(items):
-            status_bits = []
-            if item.is_available:
-                status_bits.append("available")
-            elif item.is_requested:
-                status_bits.append("already requested")
-
             label = f"{item.title} ({item.year})"
             description = item.overview or ""
             if len(description) > 80:
                 description = description[:77] + "..."
             if not description:
+                status_bits = []
+                if item.is_available:
+                    status_bits.append("available")
+                elif item.is_requested:
+                    status_bits.append("already requested")
                 description = ", ".join(status_bits) if status_bits else "Series result"
 
             options.append(
@@ -424,6 +422,31 @@ class SeriesRequestView(discord.ui.View):
     async def on_timeout(self) -> None:
         for child in self.children:
             child.disabled = True
+
+
+def build_results_embed(query: str, media_type: str, items: list[SearchItem]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Search results for {media_type}",
+        description=f'Query: **{query}**\nChoose the correct result from the dropdown below.',
+    )
+
+    preview_lines = []
+    for idx, item in enumerate(items[:10], start=1):
+        flags = []
+        if item.is_available:
+            flags.append("available")
+        elif item.is_requested:
+            flags.append("requested")
+
+        suffix = f" — {', '.join(flags)}" if flags else ""
+        preview_lines.append(f"{idx}. **{item.title} ({item.year})**{suffix}")
+
+    embed.add_field(
+        name="Top matches",
+        value="\n".join(preview_lines) if preview_lines else "No results.",
+        inline=False,
+    )
+    return embed
 
 
 class RequestGroup(app_commands.Group):
@@ -499,44 +522,22 @@ class SeerrBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.seerr.start()
-        self.tree.add_command(RequestGroup())
+
+        request_group = RequestGroup()
 
         if DISCORD_GUILD_ID:
             guild = discord.Object(id=int(DISCORD_GUILD_ID))
-            await self.tree.sync(guild=guild)
-            log.info("Synced commands to guild %s", DISCORD_GUILD_ID)
+            self.tree.add_command(request_group, guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            log.info("Synced %s guild commands to %s", len(synced), DISCORD_GUILD_ID)
         else:
-            await self.tree.sync()
-            log.info("Synced global commands")
+            self.tree.add_command(request_group)
+            synced = await self.tree.sync()
+            log.info("Synced %s global commands", len(synced))
 
     async def close(self) -> None:
         await self.seerr.close()
         await super().close()
-
-
-def build_results_embed(query: str, media_type: str, items: list[SearchItem]) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"Search results for {media_type}",
-        description=f'Query: **{query}**\nChoose the correct result from the dropdown below.',
-    )
-
-    preview_lines = []
-    for idx, item in enumerate(items[:10], start=1):
-        flags = []
-        if item.is_available:
-            flags.append("available")
-        elif item.is_requested:
-            flags.append("requested")
-
-        suffix = f" — {', '.join(flags)}" if flags else ""
-        preview_lines.append(f"{idx}. **{item.title} ({item.year})**{suffix}")
-
-    embed.add_field(
-        name="Top matches",
-        value="\n".join(preview_lines) if preview_lines else "No results.",
-        inline=False,
-    )
-    return embed
 
 
 bot = SeerrBot()
