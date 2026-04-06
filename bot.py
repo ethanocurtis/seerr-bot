@@ -27,6 +27,8 @@ SEERR_API_KEY = os.getenv("SEERR_API_KEY", "")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 RESULT_LIMIT = max(1, min(int(os.getenv("RESULT_LIMIT", "10")), 25))
 
+TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
+
 if not DISCORD_TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing")
 if not SEERR_URL:
@@ -45,6 +47,12 @@ class SearchItem:
     poster_path: str | None
     is_available: bool
     is_requested: bool
+
+    @property
+    def poster_url(self) -> str | None:
+        if not self.poster_path:
+            return None
+        return f"{TMDB_IMAGE_BASE}{self.poster_path}"
 
 
 def parse_season_input(text: str) -> str | list[int]:
@@ -89,6 +97,60 @@ def parse_season_input(text: str) -> str | list[int]:
         raise ValueError("No valid seasons were provided.")
 
     return sorted(seasons)
+
+
+def short_overview(text: str, limit: int = 100) -> str:
+    text = (text or "").strip()
+    if not text:
+        return "No overview provided."
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def build_results_embed(query: str, media_type: str, items: list[SearchItem]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Search results for {media_type}",
+        description=f'Query: **{query}**\nChoose the correct result from the dropdown below.',
+    )
+
+    preview_lines = []
+    for idx, item in enumerate(items[:10], start=1):
+        flags = []
+        if item.is_available:
+            flags.append("available")
+        elif item.is_requested:
+            flags.append("requested")
+
+        suffix = f" — {', '.join(flags)}" if flags else ""
+        preview_lines.append(f"{idx}. **{item.title} ({item.year})**{suffix}")
+
+    embed.add_field(
+        name="Top matches",
+        value="\n".join(preview_lines) if preview_lines else "No results.",
+        inline=False,
+    )
+    return embed
+
+
+def build_confirm_embed(item: SearchItem, kind: Literal["movie", "series"]) -> discord.Embed:
+    status_text = "Ready to request"
+    if item.is_available:
+        status_text = "Already available"
+    elif item.is_requested:
+        status_text = "Already requested"
+
+    embed = discord.Embed(
+        title=f"{item.title} ({item.year})",
+        description=item.overview or "No overview provided.",
+    )
+    embed.add_field(name="Type", value=kind.capitalize(), inline=True)
+    embed.add_field(name="Status", value=status_text, inline=True)
+
+    if item.poster_url:
+        embed.set_image(url=item.poster_url)
+
+    return embed
 
 
 class SeerrClient:
@@ -223,6 +285,9 @@ class SeasonRequestModal(discord.ui.Modal, title="Request Seasons"):
                 title="Series request sent",
                 description=f"Requested **{self.item.title} ({self.item.year})** with **{seasons_text}**.",
             )
+            if self.item.poster_url:
+                embed.set_thumbnail(url=self.item.poster_url)
+
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except ValueError as exc:
@@ -250,6 +315,101 @@ class SeasonRequestModal(discord.ui.Modal, title="Request Seasons"):
                 )
 
 
+class MovieConfirmView(discord.ui.View):
+    def __init__(self, seerr: SeerrClient, item: SearchItem, requester_id: int) -> None:
+        super().__init__(timeout=300)
+        self.seerr = seerr
+        self.item = item
+        self.requester_id = requester_id
+
+        request_button = discord.ui.Button(
+            label="Request Movie",
+            style=discord.ButtonStyle.green,
+        )
+        request_button.callback = self.request_callback
+        self.add_item(request_button)
+
+    async def request_callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can use this button.",
+                ephemeral=True,
+            )
+            return
+
+        if self.item.is_available:
+            await interaction.response.send_message(
+                f"**{self.item.title} ({self.item.year})** is already available.",
+                ephemeral=True,
+            )
+            return
+
+        if self.item.is_requested:
+            await interaction.response.send_message(
+                f"**{self.item.title} ({self.item.year})** has already been requested.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await self.seerr.request_movie(self.item.media_id)
+
+            success_embed = discord.Embed(
+                title="Movie request sent",
+                description=f"Requested **{self.item.title} ({self.item.year})**.",
+            )
+            if self.item.poster_url:
+                success_embed.set_thumbnail(url=self.item.poster_url)
+
+            await interaction.followup.send(embed=success_embed, ephemeral=True)
+        except Exception as exc:
+            log.exception("Failed to create movie request")
+            await interaction.followup.send(
+                f"Movie request failed: `{exc}`",
+                ephemeral=True,
+            )
+
+
+class SeriesConfirmView(discord.ui.View):
+    def __init__(self, seerr: SeerrClient, item: SearchItem, requester_id: int) -> None:
+        super().__init__(timeout=300)
+        self.seerr = seerr
+        self.item = item
+        self.requester_id = requester_id
+
+        request_button = discord.ui.Button(
+            label="Request Series",
+            style=discord.ButtonStyle.green,
+        )
+        request_button.callback = self.request_callback
+        self.add_item(request_button)
+
+    async def request_callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Only the person who ran the command can use this button.",
+                ephemeral=True,
+            )
+            return
+
+        if self.item.is_available:
+            await interaction.response.send_message(
+                f"**{self.item.title} ({self.item.year})** is already available.",
+                ephemeral=True,
+            )
+            return
+
+        if self.item.is_requested:
+            await interaction.response.send_message(
+                f"**{self.item.title} ({self.item.year})** has already been requested.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(SeasonRequestModal(self.seerr, self.item))
+
+
 class MovieSelect(discord.ui.Select):
     def __init__(
         self,
@@ -264,17 +424,7 @@ class MovieSelect(discord.ui.Select):
         options: list[discord.SelectOption] = []
         for idx, item in enumerate(items):
             label = f"{item.title} ({item.year})"
-            description = item.overview or ""
-            if len(description) > 80:
-                description = description[:77] + "..."
-            if not description:
-                status_bits = []
-                if item.is_available:
-                    status_bits.append("available")
-                elif item.is_requested:
-                    status_bits.append("already requested")
-                description = ", ".join(status_bits) if status_bits else "Movie result"
-
+            description = short_overview(item.overview, 100)
             options.append(
                 discord.SelectOption(
                     label=label[:100],
@@ -299,42 +449,10 @@ class MovieSelect(discord.ui.Select):
             return
 
         selected = self.items[int(self.values[0])]
+        embed = build_confirm_embed(selected, "movie")
+        view = MovieConfirmView(self.seerr, selected, self.requester_id)
 
-        if selected.is_available:
-            await interaction.response.send_message(
-                f"**{selected.title} ({selected.year})** is already available.",
-                ephemeral=True,
-            )
-            return
-
-        if selected.is_requested:
-            await interaction.response.send_message(
-                f"**{selected.title} ({selected.year})** has already been requested.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            await self.seerr.request_movie(selected.media_id)
-
-            embed = discord.Embed(
-                title="Movie request sent",
-                description=f"Requested **{selected.title} ({selected.year})**.",
-            )
-            await interaction.followup.send(embed=embed, ephemeral=True)
-
-            if self.view:
-                for child in self.view.children:
-                    child.disabled = True
-                await interaction.message.edit(view=self.view)
-
-        except Exception as exc:
-            log.exception("Failed to create movie request")
-            await interaction.followup.send(
-                f"Movie request failed: `{exc}`",
-                ephemeral=True,
-            )
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class SeriesSelect(discord.ui.Select):
@@ -351,17 +469,7 @@ class SeriesSelect(discord.ui.Select):
         options: list[discord.SelectOption] = []
         for idx, item in enumerate(items):
             label = f"{item.title} ({item.year})"
-            description = item.overview or ""
-            if len(description) > 80:
-                description = description[:77] + "..."
-            if not description:
-                status_bits = []
-                if item.is_available:
-                    status_bits.append("available")
-                elif item.is_requested:
-                    status_bits.append("already requested")
-                description = ", ".join(status_bits) if status_bits else "Series result"
-
+            description = short_overview(item.overview, 100)
             options.append(
                 discord.SelectOption(
                     label=label[:100],
@@ -386,22 +494,10 @@ class SeriesSelect(discord.ui.Select):
             return
 
         selected = self.items[int(self.values[0])]
+        embed = build_confirm_embed(selected, "series")
+        view = SeriesConfirmView(self.seerr, selected, self.requester_id)
 
-        if selected.is_available:
-            await interaction.response.send_message(
-                f"**{selected.title} ({selected.year})** is already available.",
-                ephemeral=True,
-            )
-            return
-
-        if selected.is_requested:
-            await interaction.response.send_message(
-                f"**{selected.title} ({selected.year})** has already been requested.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.send_modal(SeasonRequestModal(self.seerr, selected))
+        await interaction.response.edit_message(embed=embed, view=view)
 
 
 class MovieRequestView(discord.ui.View):
@@ -409,44 +505,11 @@ class MovieRequestView(discord.ui.View):
         super().__init__(timeout=120)
         self.add_item(MovieSelect(seerr, items, requester_id))
 
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True
-
 
 class SeriesRequestView(discord.ui.View):
     def __init__(self, seerr: SeerrClient, items: list[SearchItem], requester_id: int) -> None:
         super().__init__(timeout=120)
         self.add_item(SeriesSelect(seerr, items, requester_id))
-
-    async def on_timeout(self) -> None:
-        for child in self.children:
-            child.disabled = True
-
-
-def build_results_embed(query: str, media_type: str, items: list[SearchItem]) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"Search results for {media_type}",
-        description=f'Query: **{query}**\nChoose the correct result from the dropdown below.',
-    )
-
-    preview_lines = []
-    for idx, item in enumerate(items[:10], start=1):
-        flags = []
-        if item.is_available:
-            flags.append("available")
-        elif item.is_requested:
-            flags.append("requested")
-
-        suffix = f" — {', '.join(flags)}" if flags else ""
-        preview_lines.append(f"{idx}. **{item.title} ({item.year})**{suffix}")
-
-    embed.add_field(
-        name="Top matches",
-        value="\n".join(preview_lines) if preview_lines else "No results.",
-        inline=False,
-    )
-    return embed
 
 
 class RequestGroup(app_commands.Group):
